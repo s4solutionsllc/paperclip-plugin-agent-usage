@@ -227,6 +227,52 @@ export function parseClaudeCliUsageText(text: string): QuotaWindow[] {
   return windows;
 }
 
+// The CLI fallback drives Claude Code's interactive TUI on a fixed timer. When
+// the account running the Paperclip worker has never completed Claude Code's
+// first-run flow, that TUI is an onboarding wizard rather than a session, so
+// `/usage` is typed into a theme picker and the process never exits. Detecting
+// those screens lets us fail fast with an actionable message instead of
+// burning the full timeout and reporting a raw shell error.
+interface CliBlocker {
+  pattern: RegExp;
+  message: string;
+}
+
+// Patterns are matched against `normalizeForLabelSearch` output, so they carry
+// no spaces or punctuation: Claude Code's TUI lays words out with cursor-column
+// escapes (`\x1b[9G`) instead of literal spaces, so once ANSI is stripped the
+// captured text reads "WelcometoClaudeCode".
+const CLI_BLOCKERS: CliBlocker[] = [
+  {
+    pattern: /choosethetextstyle|letsgetstarted|welcometoclaudecode/,
+    message:
+      "Claude Code onboarding has not been completed for the user running Paperclip. Run `claude` once as that user and finish the first-run setup.",
+  },
+  {
+    pattern: /doyoutrustthefiles|yesproceed/,
+    message:
+      "Claude Code is waiting on its folder-trust prompt. Run `claude` once in this directory as the user running Paperclip and approve it.",
+  },
+  {
+    pattern: /pleaserunlogin|signintoclaude|invalidapikey|authenticationerror/,
+    message:
+      "Claude Code is not signed in for the user running Paperclip. Run `claude` and sign in, or configure an OAuth token.",
+  },
+];
+
+// Returns an actionable message when the captured terminal output shows Claude
+// Code stuck on an interactive prompt, or null when nothing blocking is found.
+export function detectCliBlocker(text: string): string | null {
+  const normalized = normalizeForLabelSearch(cleanTerminalText(text));
+  // A real usage panel wins: onboarding copy can linger in the scrollback of a
+  // session that went on to render usage just fine.
+  if (normalized.includes("currentsession")) return null;
+  for (const blocker of CLI_BLOCKERS) {
+    if (blocker.pattern.test(normalized)) return blocker.message;
+  }
+  return null;
+}
+
 export function friendlyErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
 
@@ -238,7 +284,11 @@ export function friendlyErrorMessage(err: unknown): string {
     return "Claude CLI not accessible — ensure Claude is installed and on your PATH.";
   }
 
-  if (/Command failed:|SIGTERM|SIGKILL|killed|sh\s+-c|script\s+-q|printf\b/i.test(msg)) {
+  if (/timed out|SIGTERM|SIGKILL|killed/i.test(msg)) {
+    return "Claude CLI timed out — it may be waiting on an interactive prompt. Run `claude` once as the user running Paperclip to finish setup.";
+  }
+
+  if (/Command failed:|sh\s+-c|script\s+-q|printf\b/i.test(msg)) {
     return "Claude CLI command failed — ensure Claude is installed and your network is available.";
   }
 
