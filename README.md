@@ -86,8 +86,23 @@ Auto-detects your Claude OAuth credentials and shows current connection status.
 |---|---|---|
 | `pollIntervalMinutes` | How often to refresh usage data | `15` |
 | `providers` | Which providers to track | `["claude"]` |
+| `claudeConfigDir` | Absolute path to the Claude Code config directory holding `.credentials.json`. Leave blank to auto-detect. | `""` |
+| `enableCliFallback` | Scrape `claude /usage` from the terminal when the usage API is unavailable | `true` |
 
-OAuth credentials are auto-detected from your local Claude install (`~/.claude` or macOS Keychain). Token lifecycle is managed by Paperclip.
+OAuth credentials are auto-detected from your local Claude install (`~/.claude`,
+`CLAUDE_CONFIG_DIR`, or macOS Keychain). Token lifecycle is managed by Paperclip.
+
+**If Paperclip runs as a different user than the one signed into Claude Code**
+— a service account, a container, a systemd unit — auto-detection looks in that
+user's home directory and finds nothing. Set `claudeConfigDir` to the signed-in
+user's `~/.claude` (for example `/home/alice/.claude`), and make sure the
+Paperclip process can read it.
+
+The CLI fallback drives Claude Code's interactive terminal UI, so it only works
+when the user running Paperclip has completed Claude Code's first-run setup
+(theme picker, folder trust, sign-in). If it hasn't, the plugin reports which
+step is blocking rather than hanging. Set `enableCliFallback` to `false` to skip
+the fallback entirely and surface the credential or API error directly.
 
 ## Agent tools
 
