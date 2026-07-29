@@ -55,6 +55,20 @@ const manifest: PaperclipPluginManifestV1 = {
         },
         default: DEFAULT_CONFIG.providers,
       },
+      claudeConfigDir: {
+        type: "string",
+        title: "Claude Config Directory",
+        description:
+          "Absolute path to the Claude Code config directory holding .credentials.json (e.g. /home/alice/.claude). Leave blank to auto-detect from CLAUDE_CONFIG_DIR or the home directory of the user running Paperclip.",
+        default: DEFAULT_CONFIG.claudeConfigDir,
+      },
+      enableCliFallback: {
+        type: "boolean",
+        title: "Enable Claude CLI Fallback",
+        description:
+          "When the usage API is unavailable, scrape `claude /usage` from the terminal. Requires that the user running Paperclip has completed Claude Code's first-run setup; disable to report the credential error directly instead.",
+        default: DEFAULT_CONFIG.enableCliFallback,
+      },
     },
   },
   jobs: [

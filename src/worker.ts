@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,7 +13,7 @@ import {
   type ToolRunContext,
 } from "@paperclipai/plugin-sdk";
 import { DEFAULT_CONFIG, JOB_KEYS, STATE_KEYS, TOOL_NAMES } from "./constants.js";
-import { friendlyErrorMessage } from "./parsing.js";
+import { detectCliBlocker, friendlyErrorMessage } from "./parsing.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -47,6 +47,8 @@ interface UsageHistoryEntry {
 interface PluginConfig {
   pollIntervalMinutes?: number;
   providers?: string[];
+  claudeConfigDir?: string;
+  enableCliFallback?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,27 +177,49 @@ async function fetchAnthropicUsage(token: string): Promise<QuotaWindow[]> {
 // Token resolution (auto-detect from local ~/.claude credentials)
 // ---------------------------------------------------------------------------
 
-function claudeConfigDir(): string {
+// The worker runs as whatever user Paperclip's service runs as, which is often
+// not the user who signed into Claude Code. That makes "which paths did we
+// actually look at" the single most useful piece of diagnostic information
+// when no token is found, so token lookup reports its search path rather than
+// silently returning null.
+interface TokenLookup {
+  token: string | null;
+  searched: string[];
+}
+
+function claudeConfigDir(configuredDir?: string | null): string {
+  if (typeof configuredDir === "string" && configuredDir.trim().length > 0) {
+    return configuredDir.trim();
+  }
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
   return path.join(os.homedir(), ".claude");
 }
 
-async function readLocalClaudeToken(): Promise<string | null> {
-  const configDir = claudeConfigDir();
+function tokenFromCredentialsJson(raw: string): string | null {
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const oauth = parsed["claudeAiOauth"] as Record<string, unknown> | undefined;
+  const token = oauth?.["accessToken"];
+  return typeof token === "string" && token.length > 0 ? token : null;
+}
+
+async function readLocalClaudeToken(configuredDir?: string | null): Promise<TokenLookup> {
+  const configDir = claudeConfigDir(configuredDir);
+  const searched: string[] = [];
+
   for (const filename of [".credentials.json", "credentials.json"]) {
+    const file = path.join(configDir, filename);
+    searched.push(file);
     try {
-      const raw = await fs.readFile(path.join(configDir, filename), "utf8");
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      const oauth = parsed["claudeAiOauth"] as Record<string, unknown> | undefined;
-      const token = oauth?.["accessToken"];
-      if (typeof token === "string" && token.length > 0) return token;
+      const token = tokenFromCredentialsJson(await fs.readFile(file, "utf8"));
+      if (token) return { token, searched };
     } catch {
       // continue
     }
   }
 
   if (process.platform === "darwin") {
+    searched.push("macOS keychain (Claude Code-credentials)");
     try {
       const { stdout } = await execFileAsync("security", [
         "find-generic-password",
@@ -203,16 +227,23 @@ async function readLocalClaudeToken(): Promise<string | null> {
         "Claude Code-credentials",
         "-w",
       ], { timeout: 3000 });
-      const parsed = JSON.parse(stdout.trim()) as Record<string, unknown>;
-      const oauth = parsed["claudeAiOauth"] as Record<string, unknown> | undefined;
-      const token = oauth?.["accessToken"];
-      if (typeof token === "string" && token.length > 0) return token;
+      const token = tokenFromCredentialsJson(stdout.trim());
+      if (token) return { token, searched };
     } catch {
       // continue
     }
   }
 
-  return null;
+  return { token: null, searched };
+}
+
+function noCredentialsMessage(searched: string[]): string {
+  return [
+    "No Claude credentials found for the user running Paperclip",
+    `(uid ${typeof process.getuid === "function" ? process.getuid() : "n/a"}, home ${os.homedir()}).`,
+    `Looked in: ${searched.join(", ")}.`,
+    "Sign in with `claude` as that user, or set the Claude config directory in this plugin's settings.",
+  ].join(" ");
 }
 
 function extractAccountEmail(parsed: unknown): string | null {
@@ -227,8 +258,11 @@ function extractAccountEmail(parsed: unknown): string | null {
 // The signed-in account lives in Claude Code's main config (`.claude.json`),
 // which sits inside CLAUDE_CONFIG_DIR when that's set and at ~/.claude.json
 // otherwise — a different file from the credentials read above.
-async function readLocalClaudeAccount(): Promise<string | null> {
+async function readLocalClaudeAccount(configuredDir?: string | null): Promise<string | null> {
   const candidates: string[] = [];
+  if (typeof configuredDir === "string" && configuredDir.trim().length > 0) {
+    candidates.push(path.join(configuredDir.trim(), ".claude.json"));
+  }
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
     candidates.push(path.join(fromEnv.trim(), ".claude.json"));
@@ -373,6 +407,93 @@ function quoteForShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+// Marks an error whose message is already operator-facing, so the outer
+// handler passes it through instead of running it back through
+// friendlyErrorMessage and flattening the detail we just assembled.
+class FriendlyError extends Error {
+  readonly friendly = true;
+}
+
+function isFriendly(err: unknown): err is FriendlyError {
+  return err instanceof Error && (err as { friendly?: boolean }).friendly === true;
+}
+
+// Raised when the CLI is parked on an interactive prompt (onboarding, folder
+// trust, login). Retrying can't help — the operator has to act — so this
+// short-circuits the retry in fetchClaudeCliQuota.
+class CliBlockedError extends FriendlyError {
+  readonly blocked = true;
+}
+
+interface ShellCapture {
+  output: string;
+  timedOut: boolean;
+}
+
+const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
+
+// `execFile`'s timeout signals only the `sh` it spawned; the `script` and
+// `claude` grandchildren survive and keep the pipe open, so a stuck TUI would
+// leak processes and stall the worker. Spawning into its own process group
+// lets us kill the whole tree.
+function runShellCapture(
+  command: string,
+  env: Record<string, string>,
+  timeoutMs: number,
+): Promise<ShellCapture> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", command], {
+      env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let output = "";
+    let timedOut = false;
+    let settled = false;
+
+    const killTree = () => {
+      if (child.pid == null) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree();
+    }, timeoutMs);
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killTree();
+      fn();
+    };
+
+    const onChunk = (chunk: Buffer) => {
+      if (output.length < MAX_CAPTURE_BYTES) output += chunk.toString("utf8");
+      // Bail as soon as an interactive prompt is recognised rather than
+      // waiting out the timeout — the keystroke feed can never clear it.
+      const blocker = detectCliBlocker(output);
+      if (blocker) finish(() => reject(new CliBlockedError(blocker)));
+    };
+
+    child.stdout?.on("data", onChunk);
+    child.stderr?.on("data", onChunk);
+
+    child.on("error", (error) => finish(() => reject(error)));
+    child.on("close", () => finish(() => resolve({ output, timedOut })));
+  });
+}
+
 async function runClaudeCliCommand(timeoutMs: number): Promise<QuotaWindow[]> {
   const feed = "(sleep 3; printf '/usage\\r'; sleep 8; printf '\\033'; sleep 1; printf '\\003')";
   const claudeCommand = "claude --tools \"\"";
@@ -380,37 +501,43 @@ async function runClaudeCliCommand(timeoutMs: number): Promise<QuotaWindow[]> {
     ? `${feed} | script -q /dev/null ${claudeCommand}`
     : `${feed} | script -q -e -f -c ${quoteForShell(claudeCommand)} /dev/null`;
 
+  let capture: ShellCapture;
   try {
-    let output = "";
-    try {
-      const { stdout, stderr } = await execFileAsync("sh", ["-c", command], {
-        env: createClaudeQuotaEnv(),
-        timeout: timeoutMs,
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      output = `${stdout}${stderr}`;
-    } catch (error) {
-      const stdout = typeof error === "object" && error !== null && "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
-      const stderr = typeof error === "object" && error !== null && "stderr" in error && typeof error.stderr === "string" ? error.stderr : "";
-      output = `${stdout}${stderr}`;
-      const cleaned = cleanTerminalText(output);
-      if (!cleaned.toLowerCase().includes("current session")) {
-        throw error;
-      }
-    }
-
-    return parseClaudeCliUsageText(output);
+    capture = await runShellCapture(command, createClaudeQuotaEnv(), timeoutMs);
   } catch (error) {
+    if (error instanceof CliBlockedError) throw error;
+    throw new Error(friendlyErrorMessage(error));
+  }
+
+  // Late-arriving prompts (drawn after the last chunk we inspected) still get
+  // caught here before we blame the parser.
+  const blocker = detectCliBlocker(capture.output);
+  if (blocker) throw new CliBlockedError(blocker);
+
+  try {
+    return parseClaudeCliUsageText(capture.output);
+  } catch (error) {
+    if (capture.timedOut) {
+      throw new Error(
+        friendlyErrorMessage(new Error(`Claude CLI timed out after ${Math.round(timeoutMs / 1000)}s`)),
+      );
+    }
     throw new Error(friendlyErrorMessage(error));
   }
 }
 
-async function fetchClaudeCliQuota(timeoutMs = 20_000): Promise<QuotaWindow[]> {
+async function fetchClaudeCliQuota(
+  logger: Pick<PluginContext["logger"], "warn">,
+  timeoutMs = 20_000,
+): Promise<QuotaWindow[]> {
   try {
     return await runClaudeCliCommand(timeoutMs);
   } catch (firstError) {
+    // An interactive prompt won't clear itself; a second attempt just burns
+    // another timeout.
+    if (firstError instanceof CliBlockedError) throw firstError;
     const msg = firstError instanceof Error ? firstError.message : String(firstError);
-    console.warn(`CLI quota fetch failed on first attempt, retrying: ${msg}`);
+    logger.warn("CLI quota fetch failed on first attempt, retrying", { error: msg });
     return await runClaudeCliCommand(timeoutMs);
   }
 }
@@ -436,7 +563,9 @@ function pollAndStore(ctx: PluginContext): Promise<ProviderSnapshot> {
 async function runPollAndStore(ctx: PluginContext): Promise<ProviderSnapshot> {
   const config = (await ctx.config.get()) as PluginConfig;
   const enabledProviders = config.providers ?? DEFAULT_CONFIG.providers;
-  const account = await readLocalClaudeAccount();
+  const configuredDir = config.claudeConfigDir ?? null;
+  const cliFallbackEnabled = config.enableCliFallback ?? DEFAULT_CONFIG.enableCliFallback;
+  const account = await readLocalClaudeAccount(configuredDir);
 
   if (!enabledProviders.includes("claude")) {
     const snapshot: ProviderSnapshot = {
@@ -454,21 +583,53 @@ async function runPollAndStore(ctx: PluginContext): Promise<ProviderSnapshot> {
 
   let snapshot: ProviderSnapshot;
   try {
-    const token = await readLocalClaudeToken();
+    const { token, searched } = await readLocalClaudeToken(configuredDir);
     let windows: QuotaWindow[];
     let source: string;
+
+    // Why the OAuth path was skipped or failed is the diagnosis that matters —
+    // the CLI fallback's own error is a symptom, not the cause. Both are
+    // logged, and the OAuth reason is carried into the final error message so
+    // it reaches the UI rather than dying in the worker log.
+    let oauthFailure: string;
 
     if (token) {
       try {
         windows = await fetchAnthropicUsage(token);
         source = "anthropic-oauth";
-      } catch {
-        windows = await fetchClaudeCliQuota();
+        oauthFailure = "";
+      } catch (err) {
+        oauthFailure = friendlyErrorMessage(err);
+        ctx.logger.warn("Anthropic usage API failed, falling back to Claude CLI", {
+          error: oauthFailure,
+        });
+        if (!cliFallbackEnabled) {
+          throw new FriendlyError(`Anthropic usage API failed: ${oauthFailure}`);
+        }
+        try {
+          windows = await fetchClaudeCliQuota(ctx.logger);
+        } catch (cliError) {
+          const cliMessage = cliError instanceof Error ? cliError.message : String(cliError);
+          throw new FriendlyError(
+            `Anthropic usage API failed: ${oauthFailure} CLI fallback also failed: ${cliMessage}`,
+          );
+        }
         source = "claude-cli";
       }
     } else {
-      windows = await fetchClaudeCliQuota();
-      source = "claude-cli";
+      oauthFailure = noCredentialsMessage(searched);
+      ctx.logger.warn("No Claude OAuth token found, falling back to Claude CLI", {
+        searched,
+        homedir: os.homedir(),
+      });
+      if (!cliFallbackEnabled) throw new FriendlyError(oauthFailure);
+      try {
+        windows = await fetchClaudeCliQuota(ctx.logger);
+        source = "claude-cli";
+      } catch (cliError) {
+        const cliMessage = cliError instanceof Error ? cliError.message : String(cliError);
+        throw new FriendlyError(`${oauthFailure} CLI fallback also failed: ${cliMessage}`);
+      }
     }
     snapshot = {
       provider: "claude",
@@ -480,7 +641,7 @@ async function runPollAndStore(ctx: PluginContext): Promise<ProviderSnapshot> {
       fetchedAt: new Date().toISOString(),
     };
   } catch (err) {
-    const message = friendlyErrorMessage(err);
+    const message = isFriendly(err) ? err.message : friendlyErrorMessage(err);
     snapshot = {
       provider: "claude",
       source: null,

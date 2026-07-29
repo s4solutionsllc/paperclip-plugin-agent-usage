@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   canonicalQuotaLabel,
   cleanTerminalText,
+  detectCliBlocker,
   extractAccountEmail,
   formatCurrency,
   formatTimeDelta,
@@ -403,10 +404,21 @@ test("friendlyErrorMessage: catches ENOENT and EACCES (regression: LAC-2503)", (
   assert.equal(friendlyErrorMessage(new Error("EACCES: permission denied, exec '/usr/bin/claude'")), expected);
 });
 
-test("friendlyErrorMessage: catches signal kills (regression: LAC-2503)", () => {
-  const expected = "Claude CLI command failed — ensure Claude is installed and your network is available.";
+// Signal kills now come from our own watchdog killing a stuck process tree,
+// so they report the timeout cause rather than the generic CLI failure.
+test("friendlyErrorMessage: signal kills report the timeout cause (regression: LAC-2503)", () => {
+  const expected =
+    "Claude CLI timed out — it may be waiting on an interactive prompt. Run `claude` once as the user running Paperclip to finish setup.";
   assert.equal(friendlyErrorMessage(new Error("process killed by SIGTERM")), expected);
   assert.equal(friendlyErrorMessage(new Error("child process killed")), expected);
+  assert.equal(friendlyErrorMessage(new Error("Claude CLI timed out after 20s")), expected);
+});
+
+test("friendlyErrorMessage: network timeouts stay network errors, not CLI timeouts", () => {
+  assert.equal(
+    friendlyErrorMessage(new Error("connect ETIMEDOUT 1.2.3.4:443")),
+    "Network unavailable — check your internet connection and try again.",
+  );
 });
 
 test("friendlyErrorMessage: catches leaked shell commands without Command failed: prefix (regression: LAC-2503)", () => {
@@ -472,4 +484,49 @@ test("extractAccountEmail: null for missing, empty, or malformed shapes", () => 
   assert.equal(extractAccountEmail({ oauthAccount: { emailAddress: "" } }), null);
   assert.equal(extractAccountEmail({ oauthAccount: { emailAddress: "   " } }), null);
   assert.equal(extractAccountEmail({ oauthAccount: { emailAddress: 42 } }), null);
+});
+
+// ---------------------------------------------------------------------------
+// detectCliBlocker — the onboarding/trust/login TUI screens that made the CLI
+// fallback hang until the execFile timeout fired and surfaced a raw
+// "Command failed: sh -c ..." error.
+// ---------------------------------------------------------------------------
+
+test("detectCliBlocker: recognises the first-run theme picker", () => {
+  const output =
+    "\x1b[31mWelcome\x1b[9Gto\x1b[12GClaude\x1b[19GCode\r\n" +
+    "Let's get started.\r\nChoose the text style that looks best with your terminal\r\n";
+  const message = detectCliBlocker(output);
+  assert.ok(message);
+  assert.match(message, /onboarding has not been completed/i);
+});
+
+test("detectCliBlocker: recognises the folder-trust prompt", () => {
+  const message = detectCliBlocker("Do you trust the files in this folder?\r\n1. Yes, proceed\r\n");
+  assert.ok(message);
+  assert.match(message, /folder-trust prompt/i);
+});
+
+test("detectCliBlocker: recognises a signed-out CLI", () => {
+  const message = detectCliBlocker("Please run /login to authenticate\r\n");
+  assert.ok(message);
+  assert.match(message, /not signed in/i);
+});
+
+test("detectCliBlocker: null for a real usage panel", () => {
+  const output = "Settings:\r\nUsage\r\nCurrent session\r\n42% used\r\n";
+  assert.equal(detectCliBlocker(output), null);
+});
+
+test("detectCliBlocker: a rendered usage panel wins over stale onboarding scrollback", () => {
+  // Onboarding copy can sit in the scrollback of a session that went on to
+  // render usage fine; that must not be reported as a blocker.
+  const output =
+    "Welcome to Claude Code\r\nChoose the text style\r\n" +
+    "Settings:\r\nUsage\r\nCurrent session\r\n42% used\r\n";
+  assert.equal(detectCliBlocker(output), null);
+});
+
+test("detectCliBlocker: null for unrelated output", () => {
+  assert.equal(detectCliBlocker("some ordinary terminal noise\r\n"), null);
 });

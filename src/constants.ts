@@ -32,4 +32,10 @@ export const STATE_KEYS = {
 export const DEFAULT_CONFIG = {
   pollIntervalMinutes: 15,
   providers: ["claude"] as string[],
+  // Empty means "auto-detect": CLAUDE_CONFIG_DIR, then ~/.claude.
+  claudeConfigDir: "",
+  // The CLI fallback screen-scrapes Claude Code's interactive TUI. It only
+  // works when the user running Paperclip has completed Claude Code's
+  // first-run setup, so it can be turned off to fail fast on OAuth instead.
+  enableCliFallback: true,
 } as const;
