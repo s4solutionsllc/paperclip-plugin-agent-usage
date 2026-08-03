@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Added a `prepare` script so `dist/` is built automatically on `npm install`. Local-path installs (`{ "isLocalPath": true }`) previously required a manual `npm run build` first, since `dist/` is gitignored and only `prepublishOnly` built it — an unbuilt local checkout would fail to install with no obvious cause.
+- Pinned `@paperclipai/plugin-sdk` to an exact version (`2026.722.0`) instead of `"latest"`, and re-synced `package-lock.json` and `bun.lock` to match — they had drifted to two different, stale SDK versions, so installs were not reproducible across package managers or over time.
+
 ### Added
 
 - Explicit **Claude Config Directory** setting, so the credentials path can be pointed at the signed-in user's `~/.claude` when Paperclip's worker runs as a different user.
