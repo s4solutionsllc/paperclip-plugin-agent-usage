@@ -158,6 +158,76 @@ no active refresh). The CLI-fallback subprocess *does* inherit this var today
 primary direct-API path never gets a chance to use it. Fixed alongside the
 scope work — see `CHANGELOG.md`.
 
+## Decision: the host-fork job-scope fix (PR #17) was not merged
+
+`lsimpsonsfdc/paperclip#17` implements the narrow scheduled-job scope fix
+described above. It turned out not to be necessary for this plugin's actual
+goal — agents making decisions off usage data — and the owner of that fork
+preferred not to carry a host-repo change for it. Reasoning:
+
+- The manual refresh action and both agent tools (`get-usage`,
+  `get-usage-summary`) already get a working company scope today, with no
+  host change, per "The interactive paths turned out to need no plugin
+  changes at all" above.
+- Both tool handlers already call `pollAndStore(ctx)` whenever the cached
+  snapshot is stale (`staleThresholdMs`), from *within* their own
+  already-scoped tool invocation. So an agent calling either tool
+  effectively gets pull-based polling for free — the exact mechanism the
+  scheduled job would have provided, just triggered by demand instead of a
+  timer.
+- The only thing genuinely lost by not fixing `runJob` is a background
+  refresh with nobody watching — the dashboard widget can show a snapshot
+  that's up to `pollIntervalMinutes` stale if no agent has called a tool and
+  nobody's clicked refresh recently. The manifest still declares the
+  `poll-usage` job; it will keep failing quietly every tick with
+  `INVOCATION_SCOPE_DENIED` until/unless a host fix like PR #17 lands. Worth
+  revisiting — either removing the job declaration (since it can't succeed
+  without a host change and just adds noise to the plugin's job-run history)
+  or leaving it as a documented known-broken piece — but out of scope for
+  this pass.
+
+PR #17 and its branch remain available on the fork if this trade-off is
+revisited later; see `doc/plugins/COMPANY_SCOPED_JOB_INVOCATION.md` there.
+
+## Credential resolution, take two: `ctx.secrets` instead of an env var
+
+The `CLAUDE_CODE_OAUTH_TOKEN` fix above shipped and was deployed, then
+failed live with the token reported as not found — even though it's set on
+the Paperclip container. Root cause, found in the live container's own
+source (`server/src/services/plugin-worker-manager.ts`,
+`spawnProcess()`):
+
+```ts
+// Security: Do NOT spread process.env into the worker. Plugins should only
+// receive a minimal, controlled environment to prevent leaking host
+// secrets (like DATABASE_URL, internal API keys, etc.).
+```
+
+Plugin worker processes only ever receive `PATH`, `NODE_PATH`, `NODE_ENV`,
+`TZ`, and whatever the plugin loader explicitly opts in — a deliberate
+security boundary, not a bug. `CLAUDE_CODE_OAUTH_TOKEN` on the container
+was never going to reach the worker's `process.env`, regardless of what the
+plugin checks for. The CLI-fallback subprocess never had it either, for the
+same reason (`createClaudeQuotaEnv()` spreads the worker's own `process.env`,
+which never had the var to begin with).
+
+Fixed properly using the SDK's documented secrets mechanism instead
+(PLUGIN_SPEC.md §22, `ctx.secrets`): added a `claudeOAuthTokenRef` field to
+`instanceConfigSchema` with `format: "secret-ref"` (renders as a secret
+picker in the settings UI, per §19.2), and `secrets.read-ref` to the
+manifest's capabilities. At runtime, `ctx.secrets.resolve(tokenRef)` — called
+with no `companyId` option, resolving against whatever invocation scope the
+host already established, exactly like `config.get()` — returns the plain
+token string. This is checked first, ahead of the env var (kept as a
+fallback for non-sandboxed usage, e.g. running this worker outside
+Paperclip entirely) and the credentials-file/Keychain lookup.
+
+Confirmed `secrets.resolve` has the identical unconditional company-scope
+requirement as `config.get` (`host-client-factory.js`, same
+`resolveRequiredCompanyId()` call) — consistent with everything above: this
+works from the action/tool paths today, and would need the same `runJob`
+scope fix to work from the scheduled job.
+
 ## Reference: exact commits at time of writing
 
 - Plugin repo: this commit's parent on `main`.

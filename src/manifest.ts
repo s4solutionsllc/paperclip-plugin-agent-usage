@@ -32,6 +32,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "ui.dashboardWidget.register",
     "ui.page.register",
     "instance.settings.register",
+    "secrets.read-ref",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -68,6 +69,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "When the usage API is unavailable, scrape `claude /usage` from the terminal. Requires that the user running Paperclip has completed Claude Code's first-run setup; disable to report the credential error directly instead.",
         default: DEFAULT_CONFIG.enableCliFallback,
+      },
+      claudeOAuthTokenRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Claude OAuth Token",
+        description:
+          "A Claude Code OAuth token (generate one with `claude setup-token`), stored as a Paperclip secret. Checked first, before any credentials file or CLAUDE_CODE_OAUTH_TOKEN environment variable — the only reliable option when Paperclip runs the plugin worker in its own sandboxed process without the host's environment.",
       },
     },
   },

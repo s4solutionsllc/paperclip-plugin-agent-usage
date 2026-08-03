@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import {
   definePlugin,
   runWorker,
+  type EnvSecretRefBinding,
   type PaperclipPlugin,
   type PluginContext,
   type PluginHealthDiagnostics,
@@ -49,6 +50,7 @@ interface PluginConfig {
   providers?: string[];
   claudeConfigDir?: string;
   enableCliFallback?: boolean;
+  claudeOAuthTokenRef?: string | EnvSecretRefBinding | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,15 +205,36 @@ function tokenFromCredentialsJson(raw: string): string | null {
   return typeof token === "string" && token.length > 0 ? token : null;
 }
 
-async function readLocalClaudeToken(configuredDir?: string | null): Promise<TokenLookup> {
+async function readLocalClaudeToken(
+  configuredDir: string | null | undefined,
+  secrets: Pick<PluginContext, "secrets">["secrets"],
+  tokenRef: PluginConfig["claudeOAuthTokenRef"],
+): Promise<TokenLookup> {
   const searched: string[] = [];
 
-  // Checked first: the standard Claude Code env var for headless/container
-  // auth (issued via `claude setup-token`). It's the explicit, intentional
-  // credential source when Paperclip runs somewhere that doesn't have — or
-  // shouldn't rely on — a `.credentials.json` file (a container without the
-  // signed-in user's home directory mounted, for instance), and it's not
-  // read from any file that can silently go stale.
+  // Checked first: an operator-configured secret ref (Claude OAuth Token
+  // setting). This is the only mechanism that actually works when Paperclip
+  // runs the plugin worker in its own sandboxed process — the host
+  // deliberately does not pass its own environment through to workers (to
+  // avoid leaking unrelated host secrets), so CLAUDE_CODE_OAUTH_TOKEN being
+  // set on the Paperclip container/host itself is invisible here regardless
+  // of what this function checks next. Resolving through ctx.secrets is the
+  // documented, supported path for a plugin to receive a value like that.
+  if (tokenRef) {
+    searched.push("claudeOAuthTokenRef config setting");
+    try {
+      const resolved = await secrets.resolve(tokenRef);
+      if (typeof resolved === "string" && resolved.trim().length > 0) {
+        return { token: resolved.trim(), searched };
+      }
+    } catch {
+      // Ref set but not resolvable (deleted, revoked, no access) — fall through.
+    }
+  }
+
+  // The env var itself: kept as a fallback for non-sandboxed usage (running
+  // this worker outside Paperclip's process model, e.g. local development),
+  // where nothing strips the ambient environment.
   searched.push("CLAUDE_CODE_OAUTH_TOKEN environment variable");
   const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (typeof envToken === "string" && envToken.trim().length > 0) {
@@ -596,7 +619,7 @@ async function runPollAndStore(ctx: PluginContext): Promise<ProviderSnapshot> {
 
   let snapshot: ProviderSnapshot;
   try {
-    const { token, searched } = await readLocalClaudeToken(configuredDir);
+    const { token, searched } = await readLocalClaudeToken(configuredDir, ctx.secrets, config.claudeOAuthTokenRef);
     let windows: QuotaWindow[];
     let source: string;
 
