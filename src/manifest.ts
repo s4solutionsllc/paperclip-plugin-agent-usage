@@ -125,12 +125,6 @@ const manifest: PaperclipPluginManifestV1 = {
         routePath: PAGE_ROUTE,
       },
       {
-        type: "settingsPage",
-        id: SLOT_IDS.settingsPage,
-        displayName: "Agent Usage Settings",
-        exportName: EXPORT_NAMES.settingsPage,
-      },
-      {
         type: "dashboardWidget",
         id: SLOT_IDS.dashboardWidget,
         displayName: "AI Usage",

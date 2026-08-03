@@ -76,9 +76,7 @@ Bars shift green → purple → red as usage approaches limits, so you spot trou
 
 ### Plugin settings
 
-Auto-detects your Claude OAuth credentials and shows current connection status.
-
-![Plugin settings](screenshots/agent-usage-settings-connected.png)
+Configuration lives on Paperclip's own generated settings form (Instance Settings → Plugins → Agent Usage Tracker), including a secret picker for the Claude OAuth token — this plugin doesn't ship a custom settings page, so that form is never hidden. Connection status (provider, account, token source) is shown on the main **Agent Usage** page and the dashboard widget instead.
 
 ## Configuration
 
