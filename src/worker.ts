@@ -204,8 +204,21 @@ function tokenFromCredentialsJson(raw: string): string | null {
 }
 
 async function readLocalClaudeToken(configuredDir?: string | null): Promise<TokenLookup> {
-  const configDir = claudeConfigDir(configuredDir);
   const searched: string[] = [];
+
+  // Checked first: the standard Claude Code env var for headless/container
+  // auth (issued via `claude setup-token`). It's the explicit, intentional
+  // credential source when Paperclip runs somewhere that doesn't have — or
+  // shouldn't rely on — a `.credentials.json` file (a container without the
+  // signed-in user's home directory mounted, for instance), and it's not
+  // read from any file that can silently go stale.
+  searched.push("CLAUDE_CODE_OAUTH_TOKEN environment variable");
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (typeof envToken === "string" && envToken.trim().length > 0) {
+    return { token: envToken.trim(), searched };
+  }
+
+  const configDir = claudeConfigDir(configuredDir);
 
   for (const filename of [".credentials.json", "credentials.json"]) {
     const file = path.join(configDir, filename);

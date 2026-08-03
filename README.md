@@ -89,14 +89,18 @@ Auto-detects your Claude OAuth credentials and shows current connection status.
 | `claudeConfigDir` | Absolute path to the Claude Code config directory holding `.credentials.json`. Leave blank to auto-detect. | `""` |
 | `enableCliFallback` | Scrape `claude /usage` from the terminal when the usage API is unavailable | `true` |
 
-OAuth credentials are auto-detected from your local Claude install (`~/.claude`,
+OAuth credentials are auto-detected in this order: the `CLAUDE_CODE_OAUTH_TOKEN`
+environment variable, then your local Claude install (`~/.claude`,
 `CLAUDE_CONFIG_DIR`, or macOS Keychain). Token lifecycle is managed by Paperclip.
 
 **If Paperclip runs as a different user than the one signed into Claude Code**
-— a service account, a container, a systemd unit — auto-detection looks in that
-user's home directory and finds nothing. Set `claudeConfigDir` to the signed-in
-user's `~/.claude` (for example `/home/alice/.claude`), and make sure the
-Paperclip process can read it.
+— a service account, a container, a systemd unit — file-based auto-detection
+looks in that user's home directory and finds nothing. Either set
+`CLAUDE_CODE_OAUTH_TOKEN` in the environment (generate one with
+`claude setup-token`) — the more reliable option in containers, since it
+doesn't depend on a mounted home directory — or set `claudeConfigDir` to the
+signed-in user's `~/.claude` (for example `/home/alice/.claude`) and make sure
+the Paperclip process can read it.
 
 The CLI fallback drives Claude Code's interactive terminal UI, so it only works
 when the user running Paperclip has completed Claude Code's first-run setup
