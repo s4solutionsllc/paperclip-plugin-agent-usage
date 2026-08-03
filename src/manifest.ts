@@ -71,7 +71,14 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.enableCliFallback,
       },
       claudeOAuthTokenRef: {
-        type: "string",
+        // A secret-ref field's saved value is either a raw string (typed or
+        // pasted directly — the host converts it to a stored secret on
+        // save) or a structured { type: "secret_ref", secretId, version }
+        // object (bound to an existing/newly-created company secret via the
+        // picker). Declaring only "string" here rejects the second shape
+        // with "must be string" the moment an operator uses the picker
+        // instead of the raw-paste fallback.
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Claude OAuth Token",
         description:
